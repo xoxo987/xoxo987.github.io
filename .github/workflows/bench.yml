@@ -1,15 +1,16 @@
 name: bench
 
 # Self-contained key-derivation benchmark, sprayed across many runners at once.
-# Purpose: find out how many keys/s a free GitHub runner gives us BEFORE committing a 2^32 job.
+# Purpose: measure how many keys/s ONE free GitHub runner really gives us, using
+# ALL its cores, BEFORE committing a 2^32 job. Reports aggregate keys/s + wall clock.
 # Manual: Actions -> bench -> Run workflow.
 
 on:
   workflow_dispatch:
     inputs:
       n:
-        description: "keys per shard"
-        default: "300000"
+        description: "keys per worker (total = n * cores)"
+        default: "500000"
         required: false
 
 jobs:
@@ -33,35 +34,59 @@ jobs:
           N: ${{ inputs.n }}
         run: |
           cat > /tmp/b.py <<'PY'
-          import os, time
+          import os, time, multiprocessing as mp
           from coincurve import PrivateKey
           from Crypto.Hash import keccak
 
-          N = int(os.environ.get("N") or 200000)
+          ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+          N = int(os.environ.get("N") or 500000)
           SH = int(os.environ.get("SHARD") or 0)
-          CORES = os.cpu_count()
-          BASE = SH * N
-          print(f"shard={SH} cores={CORES} base={BASE} n={N}")
+          CORES = os.cpu_count() or 1
+          TOTAL = N * CORES
+          BASE = SH * TOTAL
+          print(f"shard={SH} cores={CORES} base={BASE} n/worker={N} total={TOTAL}", flush=True)
 
-          # A: derivation only
-          t = time.perf_counter()
-          last = None
-          for i in range(BASE, BASE + N):
-              last = PrivateKey(i.to_bytes(32, "big")).public_key.format(compressed=False)
-          dA = time.perf_counter() - t
-          print(f"derive_only : {N/dA:,.0f} keys/s")
+          # model a funded-set membership lookup (set lookup is ~ns vs ~50us derive)
+          FUNDED = set()
+          r = 12345
+          for _ in range(100000):
+              r = (r*1103515245 + 12345) & 0xffffffff
+              FUNDED.add(r.to_bytes(20, "big"))
 
-          # B: derivation + eth keccak address (what a real scan pays for)
+          def sc(i):
+              v = i % ORDER
+              return v if v else 1
+
+          def work(args):
+              start, count = args
+              last = 0; hits = 0
+              for i in range(start, start + count):
+                  pub = PrivateKey(sc(i).to_bytes(32, "big")).public_key.format(compressed=False)
+                  k = keccak.new(digest_bits=256); k.update(pub[1:])
+                  a = k.digest()[-20:]
+                  last ^= a[0]
+                  if a in FUNDED: hits += 1
+              return count, last, hits
+
+          # ---- single core reference ----
           t = time.perf_counter()
-          acc = 0
-          for i in range(BASE, BASE + N):
-              pub = PrivateKey(i.to_bytes(32, "big")).public_key.format(compressed=False)
-              k = keccak.new(digest_bits=256); k.update(pub[1:]); acc ^= k.digest()[0]
-          dB = time.perf_counter() - t
-          print(f"derive+addr : {N/dB:,.0f} keys/s")
-          print(f"rate : {N/dB:,.0f}")
-          print(f"proof: shard={SH} last_pub0={last[0]} addr_xor={acc}")
+          work((BASE, N))
+          d1 = time.perf_counter() - t
+          print(f"single_core : {N/d1:,.0f} keys/s", flush=True)
+
+          # ---- full runner (all cores) ----
+          chunks = [(BASE + w*N, N) for w in range(CORES)]
+          t = time.perf_counter()
+          done = 0; xr = 0; hits = 0
+          with mp.Pool(CORES) as p:
+              for c, l, h in p.imap_unordered(work, chunks):
+                  done += c; xr ^= l; hits += h
+          dW = time.perf_counter() - t
+          agg = done / dW
+          print(f"aggregate   : {agg:,.0f} keys/s over {CORES} cores", flush=True)
+          print(f"rate : {agg:,.0f}", flush=True)
+          print(f"proof: shard={SH} {agg:,.0f} keys/s done={done} xor={xr} hits={hits}", flush=True)
           PY
           python3 /tmp/b.py | tee -a out.txt
           RATE=$(grep -oE '^rate : [0-9,]+' out.txt | tr -dc '0-9')
-          echo "### shard $SHARD — ${RATE} keys/s on ${N} keys" >> "$GITHUB_STEP_SUMMARY"
+          echo "### shard $SHARD — **${RATE} keys/s** (all cores)" >> "$GITHUB_STEP_SUMMARY"
