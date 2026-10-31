@@ -1,0 +1,57 @@
+name: llm
+
+# Zero-key free LLM from CI: uses the built-in GITHUB_TOKEN with `models: read`.
+# No API key stored anywhere. Proves the CI army can also think for free.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: github models — PAT-free, straight from runner
+        env:
+          TOK: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "token len: ${#TOK}"
+          for U in \
+            "https://models.github.ai/inference/chat/completions" \
+            "https://models.inference.ai.azure.com/chat/completions" \
+            "https://models.github.ai/inference/models"
+          do
+            echo "=== POST $U"
+            curl -s -m 30 -D /tmp/h.txt -o /tmp/b.txt \
+              -w "HTTP %{http_code} ct=%{content_type} len=%{size_download}\n" \
+              "$U" \
+              -H "Authorization: Bearer $TOK" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -H "User-Agent: curl/8.5.0" \
+              -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Say GH-OK"}],"max_tokens":16}' || true
+            head -c 400 /tmp/b.txt; echo
+            grep -iE "^(x-github|x-ms|server|www-authenticate|apim|content-type)" /tmp/h.txt | head -8 || true
+            echo
+          done
+      - name: python urllib variant
+        env:
+          TOK: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.request, json
+          t=os.environ["TOK"]
+          for base in ("https://models.github.ai/inference",):
+              req=urllib.request.Request(base+"/chat/completions",
+                data=json.dumps({"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Say PY-OK"}],"max_tokens":16}).encode(),
+                headers={"Authorization":"Bearer "+t,"Content-Type":"application/json","User-Agent":"curl/8.5.0","Accept":"application/json"})
+              try:
+                  r=urllib.request.urlopen(req,timeout=60)
+                  print(base,"->",r.status,dict(r.headers),r.read()[:300])
+              except Exception as e:
+                  print(base,"ERR",type(e).__name__,e)
+          PY
