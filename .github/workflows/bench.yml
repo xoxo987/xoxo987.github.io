@@ -1,0 +1,67 @@
+name: bench
+
+# Self-contained key-derivation benchmark, sprayed across many runners at once.
+# Purpose: find out how many keys/s a free GitHub runner gives us BEFORE committing a 2^32 job.
+# Manual: Actions -> bench -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "keys per shard"
+        default: "300000"
+        required: false
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    name: shard-${{ matrix.shard }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: deps
+        run: pip install -q --disable-pip-version-check coincurve pycryptodome
+      - name: bench
+        env:
+          SHARD: ${{ matrix.shard }}
+          N: ${{ inputs.n }}
+        run: |
+          cat > /tmp/b.py <<'PY'
+          import os, time
+          from coincurve import PrivateKey
+          from Crypto.Hash import keccak
+
+          N = int(os.environ.get("N") or 200000)
+          SH = int(os.environ.get("SHARD") or 0)
+          CORES = os.cpu_count()
+          BASE = SH * N
+          print(f"shard={SH} cores={CORES} base={BASE} n={N}")
+
+          # A: derivation only
+          t = time.perf_counter()
+          last = None
+          for i in range(BASE, BASE + N):
+              last = PrivateKey(i.to_bytes(32, "big")).public_key.format(compressed=False)
+          dA = time.perf_counter() - t
+          print(f"derive_only : {N/dA:,.0f} keys/s")
+
+          # B: derivation + eth keccak address (what a real scan pays for)
+          t = time.perf_counter()
+          acc = 0
+          for i in range(BASE, BASE + N):
+              pub = PrivateKey(i.to_bytes(32, "big")).public_key.format(compressed=False)
+              k = keccak.new(digest_bits=256); k.update(pub[1:]); acc ^= k.digest()[0]
+          dB = time.perf_counter() - t
+          print(f"derive+addr : {N/dB:,.0f} keys/s")
+          print(f"rate : {N/dB:,.0f}")
+          print(f"proof: shard={SH} last_pub0={last[0]} addr_xor={acc}")
+          PY
+          python3 /tmp/b.py | tee -a out.txt
+          RATE=$(grep -oE '^rate : [0-9,]+' out.txt | tr -dc '0-9')
+          echo "### shard $SHARD — ${RATE} keys/s on ${N} keys" >> "$GITHUB_STEP_SUMMARY"

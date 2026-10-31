@@ -1,0 +1,16 @@
+name: ping
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "runner up: $(uname -a)"
+          echo "cpu: $(nproc) cores"
+          echo "egress: $(curl -s -4 https://ifconfig.me || true)"
+          python3 -V
