@@ -62,6 +62,7 @@ jobs:
           import os, sys, time, mmap, multiprocessing as mp, json, urllib.request
           from coincurve import PrivateKey
           from Crypto.Hash import keccak
+          K = lambda b: keccak.new(digest_bits=256, data=b).digest()
 
           ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
           TOTAL   = int(os.environ["TOTAL"]);  START = int(os.environ.get("START") or 0)
@@ -90,7 +91,7 @@ jobs:
               if CAMPAIGN == "range":
                   k = seed
               else:
-                  k = int.from_bytes(keccak.keccak_256(seed.to_bytes(8, "little")).digest(), "big")
+                  k = int.from_bytes(K(seed.to_bytes(8, "little")), "big")
               k %= ORDER
               return k or 1
 
@@ -100,7 +101,7 @@ jobs:
               for s in range(a, b):
                   k = privkey(s)
                   raw = k.to_bytes(32, "big")
-                  addr = keccak.keccak_256(PrivateKey(raw).public_key.format(compressed=False)[1:]).digest()[-20:]
+                  addr = K(PrivateKey(raw).public_key.format(compressed=False)[1:])[-20:]
                   if member(addr):
                       out.append((s, "0x" + addr.hex()))
               return out
