@@ -1,0 +1,70 @@
+name: haystack
+
+# TASK F: build the seed->fingerprint haystack ONCE (target-independent EC work).
+# Each shard writes 7 B/seed for its fixed seed slice; concatenating shards in order gives a
+# file whose record index IS the seed. A future batch then streams it instead of re-deriving 2^32.
+# 2^32 x 7 B = 30.06e9 B -> fits the box's ~33.9e9 free (the 8 B form does not).
+on:
+  workflow_dispatch:
+    inputs:
+      total:
+        description: "seed-space size"
+        default: "4294967296"
+      start:
+        description: "seed-space offset"
+        default: "0"
+      shards:
+        description: "number of shards (match matrix)"
+        default: "20"
+      fp_bytes:
+        description: "fingerprint bytes per seed (7 to fit the box)"
+        default: "7"
+
+concurrency:
+  group: haystack
+  cancel-in-progress: false
+
+jobs:
+  hay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    name: hay-${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsecp256k1-dev build-essential
+      - name: build
+        run: |
+          set -euxo pipefail
+          cat > /tmp/probe.c <<'C'
+          #include <secp256k1.h>
+          int main(){ secp256k1_pubkey p; unsigned char o[65]; size_t n=65;
+            secp256k1_ec_pubkey_serialize(o,&n,&p,SECP256K1_EC_COMPRESSED);
+            secp256k1_ec_pubkey_create(&p,o); secp256k1_ec_pubkey_parse(&p,o,n); return 0; }
+          C
+          if cc -O2 /tmp/probe.c -lsecp256k1 -o /tmp/probe 2>/dev/null; then MOD=-DSK_MODERN; echo modern; else MOD=; echo legacy; fi
+          g++ -O3 -std=c++17 -pthread $MOD crack/haystack.cpp -o haystack -lsecp256k1 -lpthread
+      - name: run shard
+        run: |
+          set -euo pipefail
+          TOTAL=${{ github.event.inputs.total }}; START=${{ github.event.inputs.start }}
+          SHARDS=${{ github.event.inputs.shards }}; SH=${{ matrix.shard }}
+          FPB=${{ github.event.inputs.fp_bytes }}
+          SPAN=$(( TOTAL / SHARDS )); LO=$(( START + SH * SPAN )); HI=$(( LO + SPAN ))
+          if [ "$SH" -eq "$(( SHARDS - 1 ))" ]; then HI=$(( START + TOTAL )); fi
+          echo "shard $SH seeds [$LO,$HI) fp=$FPB"
+          ./haystack "hay_$SH.bin" --lo "$LO" --hi "$HI" --threads "$(nproc)" --fp-bytes "$FPB" 2> "hay_$SH.log"
+          ls -l "hay_$SH.bin"
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hay-${{ matrix.shard }}
+          path: |
+            hay_${{ matrix.shard }}.bin
+            hay_${{ matrix.shard }}.log
+          if-no-files-found: ignore
