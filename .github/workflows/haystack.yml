@@ -19,6 +19,9 @@ on:
       fp_bytes:
         description: "fingerprint bytes per seed (7 to fit the box)"
         default: "7"
+      bloom_bytes:
+        description: "per-shard bloom bytes (20 shards; 4.5e8 -> ~1% combined fp)"
+        default: "450000000"
 
 concurrency:
   group: haystack
@@ -53,12 +56,13 @@ jobs:
           set -euo pipefail
           TOTAL=${{ github.event.inputs.total }}; START=${{ github.event.inputs.start }}
           SHARDS=${{ github.event.inputs.shards }}; SH=${{ matrix.shard }}
-          FPB=${{ github.event.inputs.fp_bytes }}
+          FPB=${{ github.event.inputs.fp_bytes }}; BL=${{ github.event.inputs.bloom_bytes }}
           SPAN=$(( TOTAL / SHARDS )); LO=$(( START + SH * SPAN )); HI=$(( LO + SPAN ))
           if [ "$SH" -eq "$(( SHARDS - 1 ))" ]; then HI=$(( START + TOTAL )); fi
           echo "shard $SH seeds [$LO,$HI) fp=$FPB"
-          ./haystack "hay_$SH.bin" --lo "$LO" --hi "$HI" --threads "$(nproc)" --fp-bytes "$FPB" 2> "hay_$SH.log"
-          ls -l "hay_$SH.bin"
+          ./haystack "hay_$SH.bin" --lo "$LO" --hi "$HI" --threads "$(nproc)" --fp-bytes "$FPB" \
+            --bloom "bloom_$SH.bin" --bloom-bytes "$BL" 2> "hay_$SH.log"
+          ls -l "hay_$SH.bin" "bloom_$SH.bin"
       - name: upload
         if: always()
         uses: actions/upload-artifact@v4
@@ -66,5 +70,6 @@ jobs:
           name: hay-${{ matrix.shard }}
           path: |
             hay_${{ matrix.shard }}.bin
+            bloom_${{ matrix.shard }}.bin
             hay_${{ matrix.shard }}.log
           if-no-files-found: ignore
