@@ -43,6 +43,14 @@ static inline int SK_neg(secp256k1_context* c, secp256k1_pubkey* p){ return secp
 static inline int SK_tadd(secp256k1_context* c, secp256k1_pubkey* p, const unsigned char* t){ return secp256k1_ec_pubkey_tweak_add(c, p, t); }
 #endif
 
+static inline int SK_combine(secp256k1_context* c, secp256k1_pubkey* o, const secp256k1_pubkey** ins, size_t n) {
+#ifdef SK_MODERN
+    (void)c; return secp256k1_ec_pubkey_combine(o, (const secp256k1_pubkey* const*)ins, n);
+#else
+    return secp256k1_ec_pubkey_combine(c, o, (const secp256k1_pubkey* const*)ins, n);
+#endif
+}
+
 static const int32_t HALF = 0xFFFFFF;                 // idx in [-HALF, HALF]  (v1.12 range)
 static const uint32_t HALF_U = (uint32_t)HALF;
 
@@ -134,34 +142,37 @@ static void build_table(int nthreads) {
         secp256k1_context_destroy(cx);
     }
     secp256k1_context_destroy(ctx0);
-    // parallelise over (target, idx-chunk) so every thread works even with one target
-    const size_t CH = 1u << 20;                        // 1,048,576 idx per task
-    const size_t NC = (per + CH - 1) / CH;
+    // COUNTER SERIES by point ADDITION (not per-target mults): Q = (1<<232)*G,
+    //   dir=+1: R_w = T + w*Q  -> idx = +w   ; dir=-1: R_w = T - w*Q -> idx = -w
+    // 2 additions-series per target; ~2*HALF additions/target total. 2*N tasks.
+    unsigned char qs[32]; memset(qs, 0, 32); qs[2] = 0x01;   // 1 << 232, big-endian
     std::atomic<size_t> next{0};
     std::atomic<size_t> done{0};
+    const size_t NT = T.size() * 2;
     auto worker = [&]() {
         secp256k1_context* c = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
-        unsigned char tw[32];
+        secp256k1_pubkey Q; SK_create(c, &Q, qs);
+        secp256k1_pubkey Qneg = Q; SK_neg(c, &Qneg);
+        auto emit = [&](size_t k, int32_t idx, const secp256k1_pubkey* R) {
+            unsigned char sb[33]; size_t sn = 33;
+            SK_ser(c, sb, &sn, R, SECP256K1_EC_COMPRESSED);
+            uint64_t h; memcpy(&h, sb + 25, 8);
+            TABLE[(size_t)k * per + (size_t)(idx + HALF)] = Ent{h, pack_meta((int)k, idx)};
+        };
         size_t task;
-        while ((task = next.fetch_add(1)) < T.size() * NC) {
-            size_t k = task / NC, ci = task % NC;
-            int32_t idx0 = (int32_t)(ci * CH) - HALF;
-            int32_t idx1 = (int32_t)std::min((ci + 1) * CH, per) - HALF - 1;
-            secp256k1_pubkey bp = base[k];
-            for (int32_t idx = idx0; idx <= idx1; idx++) {
-                bool neg = idx < 0; int32_t a = neg ? -idx : idx;
-                if (neg) be23neg(tw, a); else be23(tw, a);
-                secp256k1_pubkey temp = bp;
-                if (!SK_tadd(c, &temp, tw)) { fprintf(stderr, "tweak fail\n"); exit(1); }
-                unsigned char sb[33]; size_t sn = 33;
-                SK_ser(c, sb, &sn, &temp, SECP256K1_EC_COMPRESSED);
-                uint64_t h; memcpy(&h, sb + 25, 8);
-                Ent e{h, pack_meta((int)k, idx)};
-                TABLE[(size_t)k * per + (size_t)(idx + HALF)] = e;
+        while ((task = next.fetch_add(1)) < NT) {
+            size_t k = task / 2; int dir = (task % 2) ? -1 : +1;
+            secp256k1_pubkey R = base[k], tmp;
+            const secp256k1_pubkey* ins[2] = {&R, dir > 0 ? &Q : &Qneg};
+            if (dir > 0) {
+                emit(k, 0, &R);
+                for (int32_t w = 1; w <= HALF; w++) { SK_combine(c, &tmp, ins, 2); R = tmp; emit(k, w, &R); }
+            } else {
+                for (int32_t w = 1; w <= HALF; w++) { SK_combine(c, &tmp, ins, 2); R = tmp; emit(k, -w, &R); }
             }
             size_t d = done.fetch_add(1) + 1;
-            if (d % 8 == 0 || d == T.size() * NC)
-                fprintf(stderr, "  table %zu/%zu tasks\n", d, T.size() * NC);
+            if (d % 4 == 0 || d == NT)
+                fprintf(stderr, "  table %zu/%zu series\n", d, NT);
         }
         secp256k1_context_destroy(c);
     };
