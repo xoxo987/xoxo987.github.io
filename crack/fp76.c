@@ -6,7 +6,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: fp76 <in.fp7> <out.fp6>\n"); return 1; }
     FILE* in = fopen(argv[1], "rb");
-    FILE* out = fopen(argv[2], "wb");
+    FILE* out = fopen(argv[2], "ab");
     if (!in || !out) { perror("open"); return 1; }
     const size_t BUF = 1u << 20;                 // records per pass
     unsigned char* b = malloc(BUF * 7);
